@@ -4,6 +4,8 @@ import base64
 import asyncio
 import websockets
 import httpx
+import aiosqlite
+from urllib.parse import parse_qs
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import Response
 from groq import AsyncGroq
@@ -39,13 +41,76 @@ DG_URL = (
 # Global state for barge-in detection
 is_ai_speaking = asyncio.Event()
 
+# Database setup
+DB_PATH = "voice_ai_memory.db"
+
+async def init_db():
+    """Initialize SQLite database with conversation history table"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_history (
+                phone_number TEXT PRIMARY KEY,
+                history TEXT NOT NULL,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.commit()
+    print("✅ Database initialized")
+
+@app.on_event("startup")
+async def startup_event():
+    await init_db()
+
+async def load_conversation_history(phone_number: str) -> list:
+    """Load conversation history from database"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT history FROM conversation_history WHERE phone_number = ?",
+                (phone_number,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    history = json.loads(row[0])
+                    print(f"📚 Loaded {len(history)} messages from history for {phone_number}")
+                    return history
+                else:
+                    print(f"📝 No history found for {phone_number}, starting fresh")
+                    return []
+    except Exception as e:
+        print(f"❌ Error loading history: {e}")
+        return []
+
+async def save_conversation_history(phone_number: str, history: list):
+    """Save conversation history to database (UPSERT)"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO conversation_history (phone_number, history, last_updated)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(phone_number) 
+                DO UPDATE SET 
+                    history = excluded.history,
+                    last_updated = CURRENT_TIMESTAMP
+            """, (phone_number, json.dumps(history)))
+            await db.commit()
+        print(f"💾 Saved {len(history)} messages for {phone_number}")
+    except Exception as e:
+        print(f"❌ Error saving history: {e}")
+
 @app.post("/incoming-call")
 async def handle_incoming_call(request: Request):
+    form_data = await request.form()
+    # Extract caller's phone number to use as the Database ID
+    caller_number = form_data.get("From", "unknown_number") 
+    
+    print(f"📞 Incoming call from: {caller_number}")
+    
     host = request.headers.get("host")
     protocol = "wss" if "https" in str(request.url) else "ws"
-    websocket_url = f"{protocol}://{host}/media-stream"
     
-    print(f"📞 Incoming call received!")
+    # Append phone number as query parameter to the WebSocket URL
+    websocket_url = f"{protocol}://{host}/media-stream?phone={caller_number}"
     
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -74,6 +139,7 @@ async def generate_ai_response(user_transcript: str, twilio_ws: WebSocket, strea
         async for audio_chunk in stream_llm_to_tts(user_transcript, conversation_history):
             await send_audio_to_twilio(audio_chunk, twilio_ws, stream_sid)
         
+        # Twilio Telemetry: Ask Twilio to tell us when audio physically finishes
         await twilio_ws.send_json({
             "event": "mark",
             "streamSid": stream_sid,
@@ -93,10 +159,13 @@ async def generate_ai_response(user_transcript: str, twilio_ws: WebSocket, strea
 
 async def stream_llm_to_tts(user_transcript: str, conversation_history: list):
     system_prompt = """You are a helpful AI assistant on a phone call. 
-Keep responses concise (1-2 sentences max). Speak naturally and conversationally."""
+Keep responses concise (1-2 sentences max). Speak naturally and conversationally.
+You have access to the conversation history, so you can reference previous topics."""
     
-    conversation_history.append({"role": "user", "content": user_transcript})
-    messages = [{"role": "system", "content": system_prompt}] + conversation_history
+    # Build messages with system prompt + persistent history
+    messages = [{"role": "system", "content": system_prompt}]
+    # Keep last 20 messages to avoid token limits
+    messages.extend(conversation_history[-20:])
 
     try:
         completion = await groq_client.chat.completions.create(
@@ -117,10 +186,12 @@ Keep responses concise (1-2 sentences max). Speak naturally and conversationally
                 print(f"{text_chunk}", end="", flush=True)
         
         print(f"\n📝 Complete response: '{full_response}'")
-        conversation_history.append({"role": "assistant", "content": full_response})
         
-        if len(conversation_history) > 20:
-            del conversation_history[:-20]
+        # Add AI response to the persistent history array
+        conversation_history.append({
+            "role": "assistant",
+            "content": full_response
+        })
         
         print("🔊 Generating speech with Deepgram Aura...")
         async with httpx.AsyncClient() as client:
@@ -168,12 +239,21 @@ async def handle_media_stream(twilio_ws: WebSocket):
     print("📞 Twilio WebSocket connection attempt...")
     await twilio_ws.accept()
     
+    # Extract phone number from query parameters
+    query_string = twilio_ws.scope.get("query_string", b"").decode()
+    query_params = parse_qs(query_string)
+    phone_number = query_params.get("phone", ["unknown"])[0]
+    
+    print(f"📱 Caller phone number: {phone_number}")
+    
+    # Load conversation history from SQLite database
+    conversation_history = await load_conversation_history(phone_number)
+    
     auth_headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
     dg_ws = None
     dg_task = None
     stream_sid = None
     active_ai_task = None
-    conversation_history = []
     
     try:
         dg_ws = await websockets.connect(DG_URL, additional_headers=auth_headers)
@@ -195,12 +275,11 @@ async def handle_media_stream(twilio_ws: WebSocket):
                             is_final = result.get("is_final", False)
                             speech_final = result.get("speech_final", False)
                             
-                            # MERGED FIX 2: The Noise-Filtered Barge-In Check (2+ words)
+                            # The Noise-Filtered Barge-In Check (2+ words)
                             word_count = len(transcript.strip().split())
                             if word_count >= 2 and is_ai_speaking.is_set():
                                 print(f"\n🚨 BARGE-IN DETECTED: '{transcript}' ({word_count} words)")
                                 
-                                # Step 1: Cancel AI task
                                 if active_ai_task and not active_ai_task.done():
                                     print("❌ Cancelling AI response...")
                                     active_ai_task.cancel()
@@ -209,7 +288,6 @@ async def handle_media_stream(twilio_ws: WebSocket):
                                     except asyncio.CancelledError:
                                         pass
                                         
-                                # Step 2: Clear Twilio buffer
                                 if stream_sid:
                                     print("🧹 Flushing Twilio audio buffer...")
                                     await twilio_ws.send_json({
@@ -217,7 +295,6 @@ async def handle_media_stream(twilio_ws: WebSocket):
                                         "streamSid": stream_sid
                                     })
                                     
-                                # Step 3: Reset state
                                 is_ai_speaking.clear()
                                 latest_transcript = ""
                                 print("✅ Ready to listen again\n")
@@ -232,6 +309,13 @@ async def handle_media_stream(twilio_ws: WebSocket):
                             # Trigger response only if AI is NOT speaking
                             if speech_final and latest_transcript.strip() and not is_ai_speaking.is_set():
                                 print(f"🛑 User finished speaking")
+                                
+                                # Add user message to history before generating response
+                                conversation_history.append({
+                                    "role": "user",
+                                    "content": latest_transcript
+                                })
+                                
                                 active_ai_task = asyncio.create_task(
                                     generate_ai_response(
                                         user_transcript=latest_transcript,
@@ -282,6 +366,12 @@ async def handle_media_stream(twilio_ws: WebSocket):
         print(f"❌ Fatal error: {e}")
         
     finally:
+        # Save conversation history to database when the call ends
+        if phone_number != "unknown_number" and conversation_history:
+            print(f"💾 Saving conversation history for {phone_number}...")
+            # We use asyncio.create_task to ensure it saves even as the socket closes
+            asyncio.create_task(save_conversation_history(phone_number, conversation_history))
+            
         if dg_task: dg_task.cancel()
         if dg_ws: await dg_ws.close()
         print("👋 Cleanup complete")
