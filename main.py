@@ -10,7 +10,10 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import Response
 from groq import AsyncGroq
 from dotenv import load_dotenv
-
+import pytz
+from datetime import datetime
+from tavily import TavilyClient
+import httpx
 # Load environment variables securely from .env file
 load_dotenv()
 
@@ -19,6 +22,8 @@ app = FastAPI()
 # API Keys loaded securely
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+TAVILY_API_KEY =os.getenv("TAVILY_API_KEY")
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 
 if not DEEPGRAM_API_KEY or not GROQ_API_KEY:
     raise ValueError("Missing API keys! Check your .env file.")
@@ -43,6 +48,121 @@ is_ai_speaking = asyncio.Event()
 
 # Database setup
 DB_PATH = "voice_ai_memory.db"
+tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+
+# ============================================
+# TOOL DEFINITIONS
+# ============================================
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get current weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {
+                        "type": "string",
+                        "description": "City name (e.g., 'Delhi', 'New York')"
+                    }
+                },
+                "required": ["city"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "Get current time in a specific timezone",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "timezone": {
+                        "type": "string",
+                        "description": "Timezone name (e.g., 'America/New_York', 'Asia/Kolkata')"
+                    }
+                },
+                "required": ["timezone"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "Search the web for current information",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
+
+# ============================================
+# TOOL IMPLEMENTATIONS
+# ============================================
+
+async def get_weather(city: str) -> str:
+    """Get weather using OpenWeatherMap API"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"https://api.openweathermap.org/data/2.5/weather",
+                params={
+                    "q": city,
+                    "appid": OPENWEATHER_API_KEY,
+                    "units": "metric"
+                },
+                timeout=5.0
+            )
+            data = response.json()
+            temp = data["main"]["temp"]
+            desc = data["weather"][0]["description"]
+            return f"The weather in {city} is {temp}°C with {desc}."
+    except Exception as e:
+        return f"I couldn't fetch the weather for {city}. Please try again."
+
+
+async def get_current_time(timezone: str) -> str:
+    """Get current time in timezone"""
+    try:
+        tz = pytz.timezone(timezone)
+        current_time = datetime.now(tz)
+        return f"The current time in {timezone} is {current_time.strftime('%I:%M %p')}."
+    except Exception as e:
+        return f"I couldn't find the timezone '{timezone}'. Please use format like 'America/New_York' or 'Asia/Kolkata'."
+
+
+async def search_web(query: str) -> str:
+    """Search web using Tavily"""
+    try:
+        response = tavily_client.search(query, max_results=3)
+        results = response.get("results", [])
+        if results:
+            summary = f"Here's what I found: {results[0]['content'][:200]}"
+            return summary
+        return "I couldn't find any relevant information."
+    except Exception as e:
+        return f"Web search failed: {str(e)}"
+
+
+# Tool executor mapping
+TOOL_EXECUTOR = {
+    "get_weather": get_weather,
+    "get_current_time": get_current_time,
+    "search_web": search_web
+}
+
 
 async def init_db():
     """Initialize SQLite database with conversation history table"""
