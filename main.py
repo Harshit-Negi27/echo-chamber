@@ -14,6 +14,7 @@ import pytz
 from datetime import datetime
 from tavily import TavilyClient
 import httpx
+from twilio.rest import Client
 # Load environment variables securely from .env file
 load_dotenv()
 
@@ -47,8 +48,16 @@ DG_URL = (
 is_ai_speaking = asyncio.Event()
 
 # Database setup
-DB_PATH = "voice_ai_memory.db"
+DB_PATH = "voice_ai_memory_v2.db"
 tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
+
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+
+if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+    raise ValueError("Missing Twilio credentials in .env file!")
+
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # ============================================
 # TOOL DEFINITIONS
@@ -103,6 +112,18 @@ TOOLS = [
                     }
                 },
                 "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "transfer_to_human",
+            "description": "Transfer the call to a real human agent if the user asks to speak to a person, manager, or needs help beyond your capabilities.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
             }
         }
     }
@@ -221,16 +242,16 @@ async def save_conversation_history(phone_number: str, history: list):
 @app.post("/incoming-call")
 async def handle_incoming_call(request: Request):
     form_data = await request.form()
-    # Extract caller's phone number to use as the Database ID
     caller_number = form_data.get("From", "unknown_number") 
+    call_sid = form_data.get("CallSid") # ✅ GRAB THE CALL ID
     
-    print(f"📞 Incoming call from: {caller_number}")
+    print(f"📞 Incoming call from: {caller_number} | SID: {call_sid}")
     
     host = request.headers.get("host")
     protocol = "wss" if "https" in str(request.url) else "ws"
     
-    # Append phone number as query parameter to the WebSocket URL
-    websocket_url = f"{protocol}://{host}/media-stream?phone={caller_number}"
+    # ✅ APPEND CALL_SID TO THE URL
+    websocket_url = f"{protocol}://{host}/media-stream?phone={caller_number}&amp:call_sid={call_sid}"
     
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -251,12 +272,12 @@ async def handle_call_status(request: Request):
 # AI Response Pipeline
 # ============================================
 
-async def generate_ai_response(user_transcript: str, twilio_ws: WebSocket, stream_sid: str, conversation_history: list):
+async def generate_ai_response(user_transcript: str, twilio_ws: WebSocket, stream_sid: str, conversation_history: list, call_sid: str):
     print(f"\n🧠 Generating AI response for: '{user_transcript}'")
     is_ai_speaking.set()
     
     try:
-        async for audio_chunk in stream_llm_to_tts(user_transcript, conversation_history):
+        async for audio_chunk in stream_llm_to_tts(user_transcript, conversation_history, call_sid):
             await send_audio_to_twilio(audio_chunk, twilio_ws, stream_sid)
         
         # Twilio Telemetry: Ask Twilio to tell us when audio physically finishes
@@ -277,20 +298,26 @@ async def generate_ai_response(user_transcript: str, twilio_ws: WebSocket, strea
         import traceback
         traceback.print_exc()
 
-async def stream_llm_to_tts(user_transcript: str, conversation_history: list):
+async def stream_llm_to_tts(user_transcript: str, conversation_history: list, call_sid: str):
+    """
+    Stream with tool calling support
+    """
     system_prompt = """You are a helpful AI assistant on a phone call. 
 Keep responses concise (1-2 sentences max). Speak naturally and conversationally.
-You have access to the conversation history, so you can reference previous topics."""
+You have access to the conversation history, so you can reference previous topics.
+
+When you need real-time information (weather, time, web search), use the available tools."""
     
-    # Build messages with system prompt + persistent history
     messages = [{"role": "system", "content": system_prompt}]
-    # Keep last 20 messages to avoid token limits
     messages.extend(conversation_history[-20:])
 
     try:
+        # FIRST GROQ CALL (with tools enabled)
         completion = await groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=messages,
+            tools=TOOLS,  # ✅ Enable tool calling
+            tool_choice="auto",
             stream=True,
             max_tokens=150,
             temperature=0.7
@@ -298,21 +325,119 @@ You have access to the conversation history, so you can reference previous topic
         
         print("🧠 Groq streaming...")
         full_response = ""
+        tool_calls = []
+        
+        # Collect the stream
         async for chunk in completion:
             delta = chunk.choices[0].delta
+            
+            # Regular text response
             if delta.content:
                 text_chunk = delta.content
                 full_response += text_chunk
                 print(f"{text_chunk}", end="", flush=True)
+            
+            # Tool call detected
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    # Groq streams tool calls incrementally, accumulate them
+                    if len(tool_calls) <= tc.index:
+                        tool_calls.append({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": ""
+                            }
+                        })
+                    if tc.function.arguments:
+                        tool_calls[tc.index]["function"]["arguments"] += tc.function.arguments
         
-        print(f"\n📝 Complete response: '{full_response}'")
+        # ✅ TOOL EXECUTION PATH
+        if tool_calls:
+            print(f"\n🛠️  Tool call detected: {tool_calls}")
+            
+            # Generate and yield filler audio IMMEDIATELY
+            print("🔊 Playing filler audio...")
+            filler_audio = await generate_filler_audio("Let me check that for you.")
+            
+            # Yield filler audio in chunks
+            chunk_size = 640
+            for i in range(0, len(filler_audio), chunk_size):
+                yield filler_audio[i:i+chunk_size]
+            
+            # Execute all tool calls
+            tool_results = []
+            for tool_call in tool_calls:
+                func_name = tool_call["function"]["name"]
+                func_args = json.loads(tool_call["function"]["arguments"] or "{}")
+                
+                print(f"⚙️  Executing {func_name}({func_args})")
+                
+                # ✅ SPECIAL CASE: THE HUMAN TRANSFER HIJACK
+                if func_name == "transfer_to_human":
+                    print("🚀 INITIATING HOT-TRANSFER TO HUMAN!")
+                    
+                    # 1. Update the live Twilio call to dial your real number
+                    # IMPORTANT: Replace the +91 number below with the number you want it to forward to (e.g., your brother's phone)
+                    transfer_twiml = '<Response><Say>Please hold while I connect you to a human.</Say><Dial>+917217826794</Dial></Response>'
+                    twilio_client.calls(call_sid).update(twiml=transfer_twiml)
+                    
+                    # 2. Break the AI pipeline instantly
+                    raise Exception("TRANSFER_INITIATED_SAFELY_CLOSING_AI")
+
+                # Regular tool execution
+                elif func_name in TOOL_EXECUTOR:
+                    result = await TOOL_EXECUTOR[func_name](**func_args)
+                    print(f"✅ Tool result: {result}")
+                    
+                    tool_results.append({
+                        "tool_call_id": tool_call["id"],
+                        "role": "tool",
+                        "name": func_name,
+                        "content": result
+                    })
+            
+            # Add tool calls to history
+            conversation_history.append({
+                "role": "assistant",
+                "tool_calls": tool_calls
+            })
+            
+            # Add tool results to history
+            conversation_history.extend(tool_results)
+            
+            # SECOND GROQ CALL (with tool results)
+            messages_with_tools = [{"role": "system", "content": system_prompt}]
+            messages_with_tools.extend(conversation_history[-20:])
+            
+            print("🧠 Groq streaming final response with tool data...")
+            
+            completion2 = await groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages_with_tools,
+                stream=True,
+                max_tokens=150,
+                temperature=0.7
+            )
+            
+            full_response = ""
+            async for chunk in completion2:
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    text_chunk = delta.content
+                    full_response += text_chunk
+                    print(f"{text_chunk}", end="", flush=True)
         
-        # Add AI response to the persistent history array
+        print(f"\n📝 Final response: '{full_response}'")
+        
+        # Add final response to history
         conversation_history.append({
             "role": "assistant",
             "content": full_response
         })
         
+        # Generate speech
         print("🔊 Generating speech with Deepgram Aura...")
         async with httpx.AsyncClient() as client:
             response = await client.post(
@@ -335,7 +460,31 @@ You have access to the conversation history, so you can reference previous topic
         raise
     except Exception as e:
         print(f"❌ LLM/TTS error: {e}")
+        import traceback
+        traceback.print_exc()
         raise
+
+    
+async def generate_filler_audio(text: str = "Let me check that for you...") -> bytes:
+    """Generate filler audio using Deepgram Aura"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000",
+                headers={
+                    "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={"text": text},
+                timeout=10.0
+            )
+            audio_data = b""
+            async for chunk in response.aiter_bytes():
+                audio_data += chunk
+            return audio_data
+    except Exception as e:
+        print(f"❌ Filler audio error: {e}")
+        return b""    
 
 async def send_audio_to_twilio(audio_chunk: bytes, twilio_ws: WebSocket, stream_sid: str):
     try:
@@ -363,7 +512,7 @@ async def handle_media_stream(twilio_ws: WebSocket):
     query_string = twilio_ws.scope.get("query_string", b"").decode()
     query_params = parse_qs(query_string)
     phone_number = query_params.get("phone", ["unknown"])[0]
-    
+    call_sid = query_params.get("call_sid", [""])[0] # ✅ EXTRACT SID
     print(f"📱 Caller phone number: {phone_number}")
     
     # Load conversation history from SQLite database
